@@ -187,6 +187,9 @@ def apply_rotary_qk_inference_fwd(
     conjugate=False,
     rotate_pairwise=True,
     state_batch_indices: Optional[torch.Tensor] = None,
+    # 2 warps ≈ 2.1x faster than 8 for the plain rotary (programs own only
+    # MIMO_DIM x BLOCK_D elements; 8 warps was for a qk_sum variant).
+    num_warps: int = 2,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Apply rotary embedding to both q and k tensors using the same angle.
@@ -276,7 +279,7 @@ def apply_rotary_qk_inference_fwd(
             state_batch_indices is not None,
             MIMO_DIM=mimo_dim,
             BLOCK_D=triton.next_power_of_2(headdim),
-            num_warps=8,  # important, 4 warps is slower if we compute qk_sum
+            num_warps=num_warps,  # 8 was important when computing qk_sum
             ROTATE_PAIRWISE=rotate_pairwise,
         )
     return output_q, output_k, output_angle_state
