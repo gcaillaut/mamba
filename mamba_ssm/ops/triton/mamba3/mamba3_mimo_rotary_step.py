@@ -25,6 +25,7 @@ def rotary_qk_inference_kernel(
     BIAS_Q,
     BIAS_K,
     STATE_BATCH_INDICES,  # (batch,) int32 pool rows, or None
+    angle_pool_rows,      # rows of the angle-state pool (bound check)
     nheads,
     headdim,
     stride_out_q,           # (batch, mimo_dim, nheads, headdim)
@@ -65,11 +66,15 @@ def rotary_qk_inference_kernel(
     # loads are clamped to row 0 and every store is masked by ``valid``.
     if HAS_STATE_BATCH_INDICES:
         state_batch_idx = tl.load(STATE_BATCH_INDICES + pid_batch)
-        valid = state_batch_idx >= 0
-        angle_batch = tl.maximum(state_batch_idx, 0)
+        # Out-of-range rows (CUDA-graph capture dummies) = padding too.
+        valid = (state_batch_idx >= 0) & (state_batch_idx < angle_pool_rows)
+        # int64: the pool may be a page-strided view, so int32
+        # row * stride overflows once slot ids grow with server uptime.
+        angle_batch = tl.minimum(tl.maximum(state_batch_idx, 0),
+                                 angle_pool_rows - 1).to(tl.int64)
     else:
         valid = True
-        angle_batch = pid_batch
+        angle_batch = pid_batch.to(tl.int64)
     ANGLE_STATE = ANGLE_STATE + angle_batch * stride_angle_state[0] + pid_nheads * stride_angle_state[1]  # FIX: [1]
     OUT_ANGLE_STATE = OUT_ANGLE_STATE + angle_batch * stride_out_angle_state[0] + pid_nheads * stride_out_angle_state[1]  # FIX: [1]
 
@@ -260,6 +265,7 @@ def apply_rotary_qk_inference_fwd(
             bias_q,
             bias_k,
             state_batch_indices,
+            angle_state.shape[0],
             nheads,
             headdim,
             output_q.stride(),  # output strides tuples
