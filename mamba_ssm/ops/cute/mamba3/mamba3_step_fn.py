@@ -46,7 +46,7 @@ def get_gmem_tiled_copy(dtype: Type[cutlass.Numeric], major_mode_size: int, num_
 
 
 class Mamba3Step():
-    def __init__(self, tile_D: int, dstate: int, mimo: int = 1, num_warps: int = 4, remove_gate: bool = False, remove_outproj: bool = False, update_kv_state: bool = False):
+    def __init__(self, tile_D: int, dstate: int, mimo: int = 1, num_warps: int = 4, remove_gate: bool = False, remove_outproj: bool = False, update_kv_state: bool = False, rotary_dim: int = 0):
         assert num_warps >= 2
         assert dstate % 8 == 0, "dstate must be multiple of 8" # for vectorized load /store
         self.tile_D = tile_D
@@ -61,6 +61,12 @@ class Mamba3Step():
         # single D-tile per (b, h) (tile_D >= D), otherwise the bidd=0 CTA's
         # Bstate write would race other CTAs' reads.
         self.update_kv_state = update_kv_state
+        # When rotary_dim > 0, the kernel applies bias + rotary to its B/C
+        # inputs itself (and updates the per-(b,h) angle state row in the
+        # pool): callers pass PRE-rotation B/C (typically head-broadcast,
+        # stride 0 on H) and never materialize the per-head rotated tensors.
+        self.rotary_dim = rotary_dim
+        self.fuse_rotary = rotary_dim > 0
 
     def _setup_smem_layouts(self):
         self.sState_layout = cute.make_ordered_layout((self.tile_D, self.dstate), order=(1, 0))
@@ -112,6 +118,10 @@ class Mamba3Step():
         # for each batch element; when given, mState/mStateOut/mBstate/mXstate
         # are pools of shape (P, ...) indexed indirectly (avoids the PyTorch
         # gather/scatter round-trip on the SSM state).
+        mBiasQ: Optional[cute.Tensor],  # (R, H, N) — fused-rotary C bias
+        mBiasK: Optional[cute.Tensor],  # (R, H, N) — fused-rotary B bias
+        mAngleProj: Optional[cute.Tensor],  # (B, H, rotary_dim/2)
+        mAnglePool: Optional[cute.Tensor],  # (P, H, rotary_dim/2) fp32, in/out
         stream: cuda.CUstream,
     ):
         self.dtype = mState.element_type
@@ -162,6 +172,11 @@ class Mamba3Step():
 
         sZproj_size = cute.cosize(self.sProj_layout) if not self.remove_gate else 0
         sOutproj_size = cute.cosize(self.sProj_layout) if not self.remove_outproj else 0
+        # Fused-rotary: the new per-(b,h) angles are computed once into smem
+        # and consumed by both the B and C rotations; the pool row is only
+        # written at the very end of the kernel (an early in-place store races
+        # compiler-rematerialized reloads — learned the hard way).
+        sAngles_size = (self.rotary_dim // 2) if self.fuse_rotary else 0
 
         @cute.struct
         class SharedStorage:
@@ -196,6 +211,9 @@ class Mamba3Step():
                 cute.struct.MemRange[self.proj_dtype, sOutproj_size],
                 self.buffer_align_bytes,
             ]
+            sAngles: cute.struct.Align[
+                cute.struct.MemRange[Float32, sAngles_size], 128
+            ]
 
         self.shared_storage = SharedStorage
 
@@ -217,6 +235,10 @@ class Mamba3Step():
             mZ,
             mZproj,
             mStateBatchIdx,
+            mBiasQ,
+            mBiasK,
+            mAngleProj,
+            mAnglePool,
             self.sState_layout,
             self.sBC_layout,
             self.sProj_layout,
@@ -255,6 +277,10 @@ class Mamba3Step():
         mZ: Optional[cute.Tensor],  # (B, H, D), None if remove_gate
         mZproj: Optional[cute.Tensor],  # (R, H, D), None if remove_gate
         mStateBatchIdx: Optional[cute.Tensor],  # (B,) int32 pool-row indices
+        mBiasQ: Optional[cute.Tensor],  # (R, H, N)
+        mBiasK: Optional[cute.Tensor],  # (R, H, N)
+        mAngleProj: Optional[cute.Tensor],  # (B, H, A)
+        mAnglePool: Optional[cute.Tensor],  # (P, H, A) fp32 in/out
         sState_layout: cute.Layout | cute.ComposedLayout,
         sBC_layout: cute.Layout | cute.ComposedLayout,
         sProj_layout: cute.Layout | cute.ComposedLayout,
@@ -335,6 +361,10 @@ class Mamba3Step():
         sXstate = storage.sXstate.get_tensor(cute.make_layout(self.tile_D))
         sX = storage.sX.get_tensor(cute.make_layout(self.tile_D))
         sXgamma = storage.sXgamma.get_tensor(cute.make_layout(self.tile_D))
+        sAngles = (
+            storage.sAngles.get_tensor(cute.make_layout(self.rotary_dim // 2))
+            if const_expr(self.fuse_rotary) else None
+        )
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Partitioning using copy atoms
@@ -439,6 +469,68 @@ class Mamba3Step():
 
         cute.arch.cp_async_wait_group(2)  # B, Bstate, Xproj are done loading
         cute.arch.sync_threads()
+
+        if const_expr(self.fuse_rotary):
+            # ---- Fused bias + rotary on the B tile, in smem -----------------
+            # New per-(b, h) angles once into smem (consumed again for C; the
+            # pool row is only written at the END of the kernel).
+            A_half = self.rotary_dim // 2
+            gAnglePool = cute.local_tile(
+                mAnglePool[bidb_st, bidh, None], (A_half,), (0,)
+            )
+            gAngleProj = cute.local_tile(
+                mAngleProj[bidb, bidh, None], (A_half,), (0,)
+            )
+            if tidx < A_half:
+                a_proj = cute.math.tanh(
+                    Float32(gAngleProj[tidx]), fastmath=False
+                )
+                sAngles[tidx] = (
+                    Float32(gAnglePool[tidx])
+                    + a_proj * dt_val * 3.141592653589793
+                )
+            cute.arch.sync_threads()
+
+            gBiasK = cute.local_tile(
+                mBiasK[None, bidh, None], (self.mimo, self.dstate), (0, 0)
+            )
+            num_threads_k = self.num_warps * cute.arch.WARP_SIZE
+            # Rotation pairs element i with i + dstate/2 (half-half over the
+            # FULL dstate, original-RoPE style); only the first A_half pairs
+            # carry real angles, the rest are identity (angle 0 upstream).
+            pair_off = self.dstate // 2
+            total_pairs = self.mimo * A_half
+            for p0 in cutlass.range_constexpr(
+                (total_pairs + num_threads_k - 1) // num_threads_k
+            ):
+                p = p0 * num_threads_k + tidx
+                if p < total_pairs:
+                    r = p // A_half
+                    i = p % A_half
+                    lo = Float32(sB[r, i]) + Float32(gBiasK[r, i])
+                    hi = (Float32(sB[r, i + pair_off])
+                          + Float32(gBiasK[r, i + pair_off]))
+                    th = Float32(sAngles[i])
+                    c = cute.math.cos(th, fastmath=False)
+                    s = cute.math.sin(th, fastmath=False)
+                    sB[r, i] = (lo * c - hi * s).to(self.b_dtype)
+                    sB[r, i + pair_off] = (lo * s + hi * c).to(self.b_dtype)
+            # Identity dims (i in [A_half, pair_off) and partners): bias only.
+            seg = pair_off - A_half
+            total_plain = self.mimo * 2 * seg
+            for e0 in cutlass.range_constexpr(
+                (total_plain + num_threads_k - 1) // num_threads_k
+            ):
+                e = e0 * num_threads_k + tidx
+                if e < total_plain:
+                    r = e // (2 * seg)
+                    j = e % (2 * seg)
+                    n = A_half + j % seg + pair_off * (j // seg)
+                    sB[r, n] = (
+                        Float32(sB[r, n]) + Float32(gBiasK[r, n])
+                    ).to(self.b_dtype)
+            cute.arch.sync_threads()
+
         # Load B, Bstate, Xproj from smem
         smem_thr_copy_B = tiled_copy_B_s2r.get_slice(tidx % threads_per_dstate)
         # ((vecsize_dstate, 1), mimo, 1) -> ((vecsize_dstate, 1), mimo)
@@ -519,6 +611,46 @@ class Mamba3Step():
         # Do state @ C
         cute.arch.cp_async_wait_group(1)  # C is done loading
         cute.arch.sync_threads()
+
+        if const_expr(self.fuse_rotary):
+            # ---- Fused bias + rotary on the C tile (angles from smem) ------
+            A_half_c = self.rotary_dim // 2
+            gBiasQ = cute.local_tile(
+                mBiasQ[None, bidh, None], (self.mimo, self.dstate), (0, 0)
+            )
+            num_threads_c = self.num_warps * cute.arch.WARP_SIZE
+            pair_off_c = self.dstate // 2
+            total_pairs_c = self.mimo * A_half_c
+            for p0 in cutlass.range_constexpr(
+                (total_pairs_c + num_threads_c - 1) // num_threads_c
+            ):
+                p = p0 * num_threads_c + tidx
+                if p < total_pairs_c:
+                    r = p // A_half_c
+                    i = p % A_half_c
+                    lo = Float32(sC[r, i]) + Float32(gBiasQ[r, i])
+                    hi = (Float32(sC[r, i + pair_off_c])
+                          + Float32(gBiasQ[r, i + pair_off_c]))
+                    th = Float32(sAngles[i])
+                    c = cute.math.cos(th, fastmath=False)
+                    s = cute.math.sin(th, fastmath=False)
+                    sC[r, i] = (lo * c - hi * s).to(self.b_dtype)
+                    sC[r, i + pair_off_c] = (lo * s + hi * c).to(self.b_dtype)
+            seg_c = pair_off_c - A_half_c
+            total_plain_c = self.mimo * 2 * seg_c
+            for e0 in cutlass.range_constexpr(
+                (total_plain_c + num_threads_c - 1) // num_threads_c
+            ):
+                e = e0 * num_threads_c + tidx
+                if e < total_plain_c:
+                    r = e // (2 * seg_c)
+                    j = e % (2 * seg_c)
+                    n = A_half_c + j % seg_c + pair_off_c * (j // seg_c)
+                    sC[r, n] = (
+                        Float32(sC[r, n]) + Float32(gBiasQ[r, n])
+                    ).to(self.b_dtype)
+            cute.arch.sync_threads()
+
         # ((vecsize_dstate, 1), mimo, 1) -> ((vecsize_dstate, 1), 1, mimo)
         tSsC = select(smem_thr_copy_B.partition_S(sC), mode=[0, 2, 1])
         tSrC = cute.make_rmem_tensor_like(tSsC)
@@ -577,6 +709,18 @@ class Mamba3Step():
                 if warp_idx == 0:
                     if not need_bound_check_X or lane_idx < num_loads_X:
                         cute.autovec_copy(tXrX, tXgXstate)
+
+        # Fused rotary: write the new angle row LAST (every consumer read the
+        # smem copy; an earlier in-place pool store would race rematerialized
+        # loads). Padding lanes leave the pool untouched.
+        if const_expr(self.fuse_rotary):
+            if valid_st:
+                A_half_w = self.rotary_dim // 2
+                gAnglePool_w = cute.local_tile(
+                    mAnglePool[bidb_st, bidh, None], (A_half_w,), (0,)
+                )
+                if tidx < A_half_w:
+                    gAnglePool_w[tidx] = Float32(sAngles[tidx])
 
         if const_expr(mOutproj is not None):
             # Gate: z_r * sigmoid(z_r)
@@ -648,12 +792,22 @@ def mamba3_step_fn(
     # caller's scatter kernels. Requires state_batch_indices and tile_D >= headdim
     # (a single D-tile per (b, h): the Bstate write would race other CTAs'
     # reads otherwise). NOTE: mutates Bstate/Xstate.
+    rotary_dim: int = 0,  # > 0 fuses bias + rotary into the kernel: B/C are
+    # the PRE-rotation tensors (head dim may be a broadcast stride-0 view);
+    # the kernel adds rotary_bias_k/q, rotates the first rotary_dim entries
+    # of the dstate axis with angle = angle_state + tanh(angle_proj)*dt*pi,
+    # and updates rotary_angle_state row state_batch_indices[b] in place.
+    rotary_bias_q: Optional[Tensor] = None,   # (R, H, N)
+    rotary_bias_k: Optional[Tensor] = None,   # (R, H, N)
+    rotary_angle_proj: Optional[Tensor] = None,   # (B, H, rotary_dim/2)
+    rotary_angle_state: Optional[Tensor] = None,  # (P, H, rotary_dim/2) fp32
     tile_D: int = 64,
     num_warps: int = 2,
 ) -> None:
     has_z = z is not None
     has_outproj = outproj is not None
     has_state_batch_idx = state_batch_indices is not None
+    fuse_rotary = rotary_dim > 0
     inplace = state_out is None
     pool, nheads, hdim, dstate = state.shape
     if update_kv_state:
@@ -687,6 +841,19 @@ def mamba3_step_fn(
     assert dt.shape == (batch, nheads)
     assert trap.shape == (batch, nheads)
     assert xproj.shape == (mimo, nheads, hdim)
+    if fuse_rotary:
+        a_half = rotary_dim // 2
+        assert has_state_batch_idx, "fused rotary requires state_batch_indices"
+        assert rotary_dim % 2 == 0 and rotary_dim <= dstate
+        assert rotary_bias_q is not None and rotary_bias_k is not None
+        assert rotary_bias_q.shape == (mimo, nheads, dstate)
+        assert rotary_bias_k.shape == (mimo, nheads, dstate)
+        assert rotary_angle_proj is not None
+        assert rotary_angle_proj.shape == (batch, nheads, a_half)
+        assert rotary_angle_state is not None
+        assert rotary_angle_state.shape == (pool, nheads, a_half)
+        assert rotary_angle_state.dtype == torch.float32
+        assert rotary_bias_q.dtype == rotary_bias_k.dtype
     xproj = xproj.contiguous()
     if has_outproj:
         assert outproj.shape == (mimo, nheads, hdim)
@@ -735,9 +902,11 @@ def mamba3_step_fn(
         has_outproj,
         has_state_batch_idx,
         update_kv_state,
+        rotary_dim,
+        rotary_bias_q.dtype if fuse_rotary else None,
     )
     if compile_key not in mamba3_step_fn.compile_cache:
-        mamba3_step_op = Mamba3Step(tile_D, dstate, mimo, num_warps, remove_gate=not has_z, remove_outproj=not has_outproj, update_kv_state=update_kv_state)
+        mamba3_step_op = Mamba3Step(tile_D, dstate, mimo, num_warps, remove_gate=not has_z, remove_outproj=not has_outproj, update_kv_state=update_kv_state, rotary_dim=rotary_dim)
 
         # Create symbolic dimensions for batch and nheads
         batch_sym = cute.sym_int()
@@ -778,6 +947,24 @@ def mamba3_step_fn(
         state_batch_idx_fake = (
             make_fake_tensor(Int32, (batch_sym,)) if has_state_batch_idx else None
         )
+        if fuse_rotary:
+            a_half = rotary_dim // 2
+            bias_cute_dtype = torch2cute_dtype_map[rotary_bias_q.dtype]
+            div_bias = 128 // bias_cute_dtype.width
+            bias_q_fake = make_fake_tensor(
+                bias_cute_dtype, (mimo, nheads_sym, dstate), div_bias)
+            bias_k_fake = make_fake_tensor(
+                bias_cute_dtype, (mimo, nheads_sym, dstate), div_bias)
+            # angle_proj is typically a head-broadcast view (stride 0 on H):
+            # only assume a contiguous last dim.
+            angle_proj_fake = make_fake_tensor(
+                torch2cute_dtype_map[rotary_angle_proj.dtype],
+                (batch_sym, nheads_sym, a_half), 1)
+            angle_pool_fake = make_fake_tensor(
+                Float32, (pool_sym, nheads_sym, a_half), 1)
+        else:
+            bias_q_fake = bias_k_fake = None
+            angle_proj_fake = angle_pool_fake = None
 
         fake_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
@@ -800,6 +987,10 @@ def mamba3_step_fn(
             z_fake,
             zproj_fake,
             state_batch_idx_fake,
+            bias_q_fake,
+            bias_k_fake,
+            angle_proj_fake,
+            angle_pool_fake,
             fake_stream,
             options="--enable-tvm-ffi",
         )
@@ -824,6 +1015,10 @@ def mamba3_step_fn(
         z,
         zproj,
         state_batch_indices,
+        rotary_bias_q,
+        rotary_bias_k,
+        rotary_angle_proj,
+        rotary_angle_state,
     )
 
 
