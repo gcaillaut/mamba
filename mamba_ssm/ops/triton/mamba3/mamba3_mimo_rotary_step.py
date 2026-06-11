@@ -24,6 +24,7 @@ def rotary_qk_inference_kernel(
     DT,
     BIAS_Q,
     BIAS_K,
+    STATE_BATCH_INDICES,  # (batch,) int32 pool rows, or None
     nheads,
     headdim,
     stride_out_q,           # (batch, mimo_dim, nheads, headdim)
@@ -41,6 +42,7 @@ def rotary_qk_inference_kernel(
     CONJUGATE: tl.constexpr,
     HAS_BIAS_Q: tl.constexpr,
     HAS_BIAS_K: tl.constexpr,
+    HAS_STATE_BATCH_INDICES: tl.constexpr,
     MIMO_DIM: tl.constexpr,
     BLOCK_D: tl.constexpr, # headdim, no chunking
     ROTATE_PAIRWISE: tl.constexpr, # If true, rotate every pair of dimensions together. Otherwise, rotate the first half and second half separately (like in the original RoPE paper)
@@ -50,13 +52,26 @@ def rotary_qk_inference_kernel(
 
     Q = Q + pid_batch * stride_q[0] + pid_nheads * stride_q[2]
     K = K + pid_batch * stride_k[0] + pid_nheads * stride_k[2]
-    ANGLE_STATE = ANGLE_STATE + pid_batch * stride_angle_state[0] + pid_nheads * stride_angle_state[1]  # FIX: [1]
     ANGLE_PROJ = ANGLE_PROJ + pid_batch * stride_angle_proj[0] + pid_nheads * stride_angle_proj[1]      # FIX: [1]
     DT = DT + pid_batch * stride_dt[0] + pid_nheads * stride_dt[1]
 
     OUT_Q = OUT_Q + pid_batch * stride_out_q[0] + pid_nheads * stride_out_q[2]
     OUT_K = OUT_K + pid_batch * stride_out_k[0] + pid_nheads * stride_out_k[2]
-    OUT_ANGLE_STATE = OUT_ANGLE_STATE + pid_batch * stride_out_angle_state[0] + pid_nheads * stride_out_angle_state[1]  # FIX: [1]
+
+    # Angle state may live in a slot-indexed pool (paged inference): read and
+    # write row state_batch_indices[b] in place instead of row b. Negative
+    # rows (padding tokens) skip the token — q/k outputs zeroed, angle state
+    # untouched (selective_state_update semantics). Implemented return-free:
+    # loads are clamped to row 0 and every store is masked by ``valid``.
+    if HAS_STATE_BATCH_INDICES:
+        state_batch_idx = tl.load(STATE_BATCH_INDICES + pid_batch)
+        valid = state_batch_idx >= 0
+        angle_batch = tl.maximum(state_batch_idx, 0)
+    else:
+        valid = True
+        angle_batch = pid_batch
+    ANGLE_STATE = ANGLE_STATE + angle_batch * stride_angle_state[0] + pid_nheads * stride_angle_state[1]  # FIX: [1]
+    OUT_ANGLE_STATE = OUT_ANGLE_STATE + angle_batch * stride_out_angle_state[0] + pid_nheads * stride_out_angle_state[1]  # FIX: [1]
 
     rm = tl.arange(0, MIMO_DIM)
     rd = tl.arange(0, BLOCK_D)
@@ -77,13 +92,22 @@ def rotary_qk_inference_kernel(
     angle = angle_state + angle_proj * dt * 3.141592653589793  # (rotary_dim // 2)
 
     OUT_ANGLE_STATE = OUT_ANGLE_STATE + rd_half * stride_out_angle_state[2]
-    tl.store(OUT_ANGLE_STATE, angle, mask=mask_angle)
+    # NOTE: the angle store is deferred to the END of the kernel. When the
+    # update is in place (state_batch_indices), the compiler may rematerialize
+    # the angle_state load inside the multi-warp q/k section instead of
+    # keeping it in registers; storing here would race those reloads with
+    # this program's own write (flaky double-stepped rotations).
+    angle_out = angle
 
     angle = angle[None, :]  # (1, rotary_dim // 2) for mimo_dim broadcasting
     cos = tl.cos(angle)
     sin = tl.sin(angle)
     if CONJUGATE:
         sin = -sin
+    if HAS_STATE_BATCH_INDICES:
+        # Padding tokens: zeroed cos/sin make every q/k output zero.
+        cos = tl.where(valid, cos, 0.0)
+        sin = tl.where(valid, sin, 0.0)
 
     # Process Q tensor
     Q = Q + (rm[:, None] * stride_q[1] + rd[None, :] * stride_q[3])
@@ -148,6 +172,9 @@ def rotary_qk_inference_kernel(
         ko = tl.reshape(k_final, [MIMO_DIM, BLOCK_D])
         tl.store(OUT_K, ko, mask=mask)
 
+    # Angle store last (see NOTE above): safe for in-place pool updates.
+    tl.store(OUT_ANGLE_STATE, angle_out, mask=mask_angle & valid)
+
 def apply_rotary_qk_inference_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -159,6 +186,7 @@ def apply_rotary_qk_inference_fwd(
     inplace=False,
     conjugate=False,
     rotate_pairwise=True,
+    state_batch_indices: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Apply rotary embedding to both q and k tensors using the same angle.
@@ -167,22 +195,34 @@ def apply_rotary_qk_inference_fwd(
     Arguments:
         q: (batch, mimo_dim, nheads, headdim)
         k: (batch, mimo_dim, nheads, headdim)
-        angle_state: (batch, nheads, rotary_dim / 2)
+        angle_state: (batch, nheads, rotary_dim / 2), or a pool of
+            (P, nheads, rotary_dim / 2) when state_batch_indices is given
         angle_proj: (batch, nheads, rotary_dim / 2)
         dt: (batch, nheads)
         bias_q: Optional (mimo_dim, nheads, headdim) - bias to add to q before rotary
         bias_k: Optional (mimo_dim, nheads, headdim) - bias to add to k before rotary
+        state_batch_indices: Optional (batch,) int32 — row of the angle-state
+            pool for each batch element. The angle state is read from and
+            written back to row state_batch_indices[b] IN PLACE (mirrors
+            selective_state_update). Negative rows skip the token: q/k
+            outputs zeroed, state untouched.
     Returns:
         (q_out, k_out, angle_state_out): q_out and k_out are (batch, mimo_dim, nheads, headdim),
                                angle_state_out is (batch, nheads, rotary_dim / 2)
+                               (= angle_state itself when state_batch_indices is given)
     """
     batch, mimo_dim, nheads, headdim = q.shape
     assert headdim % 2 == 0
     assert k.shape == q.shape, f"k shape {k.shape} != q shape {q.shape}"
 
     rotary_dim = angle_state.shape[-1] * 2
-    assert angle_state.shape == (batch, nheads, rotary_dim // 2)
-    assert angle_state.shape == angle_proj.shape
+    if state_batch_indices is not None:
+        assert state_batch_indices.shape == (batch,)
+        assert angle_state.shape[1:] == (nheads, rotary_dim // 2)
+        assert angle_proj.shape == (batch, nheads, rotary_dim // 2)
+    else:
+        assert angle_state.shape == (batch, nheads, rotary_dim // 2)
+        assert angle_state.shape == angle_proj.shape
     assert dt.shape == (batch, nheads)
     assert rotary_dim <= headdim, "rotary_dim must be <= headdim"
     assert headdim <= 256, "Only support headdim <= 256"
@@ -197,7 +237,11 @@ def apply_rotary_qk_inference_fwd(
 
     output_q = torch.empty_like(q) if not inplace else q
     output_k = torch.empty_like(k) if not inplace else k
-    output_angle_state = torch.empty_like(angle_state) if not inplace else angle_state
+    # With state_batch_indices the angle pool is always updated in place.
+    output_angle_state = (
+        angle_state if (inplace or state_batch_indices is not None)
+        else torch.empty_like(angle_state)
+    )
 
     grid = lambda META: (nheads, batch)  # noqa
     with torch.cuda.device(q.device.index):
@@ -212,6 +256,7 @@ def apply_rotary_qk_inference_fwd(
             dt,
             bias_q,
             bias_k,
+            state_batch_indices,
             nheads,
             headdim,
             output_q.stride(),  # output strides tuples
@@ -228,6 +273,7 @@ def apply_rotary_qk_inference_fwd(
             conjugate,
             bias_q is not None,
             bias_k is not None,
+            state_batch_indices is not None,
             MIMO_DIM=mimo_dim,
             BLOCK_D=triton.next_power_of_2(headdim),
             num_warps=8,  # important, 4 warps is slower if we compute qk_sum
