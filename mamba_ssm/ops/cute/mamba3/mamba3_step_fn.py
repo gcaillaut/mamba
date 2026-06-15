@@ -306,7 +306,13 @@ class Mamba3Step():
         valid_st = Boolean(True)
         if const_expr(mStateBatchIdx is not None):
             idx_val = Int32(mStateBatchIdx[bidb])
-            valid_st = idx_val >= Int32(0)
+            # Negative (PAD_SLOT_ID) and out-of-range rows (CUDA-graph capture
+            # dummies) are both padding: clamp loads, suppress writes.
+            pool_rows = Int32(mState.shape[0])
+            valid_st = Boolean(False)
+            if idx_val >= Int32(0):
+                if idx_val < pool_rows:
+                    valid_st = Boolean(True)
             bidb_st = idx_val
             if not valid_st:
                 bidb_st = Int32(0)
